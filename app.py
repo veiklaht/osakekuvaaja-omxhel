@@ -95,4 +95,8 @@ if run:
     else:
         st.error(
             "Ei dataa tälle symbolille Finnhubista (myös alias-yritykset epäonnistuivat). "
-            "Tarkista tikkeri
+            "Tarkista tikkeri tai kokeile ADR/OTC-tunnusta."
+        )
+
+st.caption("Huom: Yahoo/yfinance 429-kuristus estää kutsut jaetulla IP:llä. "
+           "Finnhubin ilmainen avain toimii hyvin kuukausitolpille.")
