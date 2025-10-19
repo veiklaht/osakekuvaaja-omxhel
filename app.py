@@ -4,6 +4,10 @@ import os
 import unicodedata
 from functools import lru_cache
 from datetime import date
+import time
+import requests
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
 
 import streamlit as st
 import pandas as pd
@@ -11,6 +15,7 @@ import numpy as np
 import yfinance as yf
 import matplotlib.pyplot as plt
 from scipy.stats import norm
+
 
 st.set_page_config(page_title="Six Sigma Stock Plot", layout="wide")
 st.title("Six Sigma Stock Plot (Streamlit + yfinance)")
@@ -80,13 +85,85 @@ def available_exchanges() -> list:
     return ["Kaikki"] + ex_list
 
 @st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def dl(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
-    if df is None or df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [" ".join([str(c) for c in col if str(c)!=""]) for col in df.columns]
-    return df
+    """
+    Lataa Yahoo-datan robustisti:
+    - Oma Session (User-Agent), retryt & backoff
+    - Ensin yf.download(session=session)
+    - Jos epäonnistuu/tyhjä → fallback Ticker(...).history()
+    - Normalisoi multiindex-sarakkeet
+    """
+    # 1) Session + retry
+    session = requests.Session()
+    retry = Retry(
+        total=4,              # max yritykset
+        backoff_factor=0.6,   # 0.6s, 1.2s, 2.4s, 4.8s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/121.0 Safari/537.36"
+    })
+
+    # 2) Ensisijainen lataus
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            session=session,     # <-- tärkeä
+            timeout=20
+        )
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [" ".join([str(c) for c in col if str(c) != ""]) for col in df.columns]
+            return df
+    except Exception:
+        pass  # jatketaan fallbackiin
+
+    # 3) Fallback: Ticker.history (usein ohittaa downloadin bugin)
+    try:
+        tkr = yf.Ticker(ticker, session=session)
+        # “ytd”-pyynnöt leikataan itse -> hae 1y jotta datapisteitä riittää
+        _period = "1y" if period.lower() == "ytd" else period
+        hist = tkr.history(period=_period, interval=interval, auto_adjust=False, timeout=20)
+        if hist is not None and not hist.empty:
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = [" ".join([str(c) for c in col if str(c) != ""]) for col in hist.columns]
+            return hist
+    except Exception:
+        pass
+
+    # 4) Vielä lyhyt odotus ja viimeinen yritys (jos Yahoo yskii hetkellisesti)
+    try:
+        time.sleep(1.0)
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            session=session,
+            timeout=20
+        )
+        if df is not None and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [" ".join([str(c) for c in col if str(c) != ""]) for col in df.columns]
+            return df
+    except Exception:
+        pass
+
+    # 5) Kaikki epäonnistui → palauta tyhjä
+    return pd.DataFrame()
 
 def pick_price_series(df: pd.DataFrame) -> pd.Series | None:
     low = {c.lower(): c for c in df.columns}
