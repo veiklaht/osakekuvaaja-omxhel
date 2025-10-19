@@ -1,19 +1,18 @@
-# app.py — Streamlit + yfinance (batch-lataus, 3 kuvaajaa/rivi, YTD-fix, ei fast_infoa)
+# app.py — Streamlit + yfinance (batch-lataus, 3 kuvaajaa/rivi, interval-valitsin, YTD-fix)
 
-import os
 import time
 import random
 import unicodedata
+from datetime import date, timedelta
 from math import erf, sqrt
-from datetime import date
 from functools import lru_cache
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import matplotlib.pyplot as plt
+import yfinance as yf
 import requests
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
@@ -22,14 +21,14 @@ st.set_page_config(page_title="Six Sigma Stock Plot", layout="wide")
 st.title("Six Sigma Stock Plot (Streamlit + yfinance)")
 
 # ---------------------------
-# 0) Fallback-listat (valinnainen, ei verkkohakuja)
+# 0) Fallback-tickerlista (ei verkkohakuja)
 # ---------------------------
 try:
-    # jos sinulla on repoissa tämä tiedosto
-    from fallback_all import get_fallback_tickers  # noqa: E402
+    # Jos sinulla on tämä tiedosto repossa, käytä sitä
+    from fallback_all import get_fallback_tickers  # type: ignore
     df_tickers = get_fallback_tickers().copy()
 except Exception:
-    # minimi sisäänrakennettu, jos tuonti epäonnistuu
+    # Minimi sisäinen fallback
     df_tickers = pd.DataFrame([
         {"symbol":"NOKIA.HE","name":"Nokia","exchange":"Nasdaq Helsinki","country":"FI","asset_class":"Equity","currency":"EUR","segment":"Isot","notes":""},
         {"symbol":"ELISA.HE","name":"Elisa","exchange":"Nasdaq Helsinki","country":"FI","asset_class":"Equity","currency":"EUR","segment":"Isot","notes":""},
@@ -53,7 +52,6 @@ def build_options(df: pd.DataFrame) -> List[Tuple[str,str]]:
     else:
         labels = df["symbol"]
     opts = list(zip(labels.tolist(), df["symbol"].tolist()))
-    # poista duplikaatit, sortattu aksentittomasti
     seen, dedup = set(), []
     for lab, val in opts:
         if val not in seen:
@@ -87,39 +85,35 @@ def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 # periodien prioriteetti batchia varten
 PERIOD_ORDER = {"1mo":1,"3mo":2,"6mo":3,"ytd":4,"1y":5,"2y":6,"5y":7,"10y":8,"15y":9,"max":10}
-# YTD haetaan aina 1y ja leikataan UI:ssa
-def _fetch_period_for(selected: List[Tuple[str,str]]) -> str:
+
+def fetch_period_for(selected: List[Tuple[str,str,str]]) -> str:
+    """Valitse pisin tarvittava periodi annetulle listalle (symbol, period, interval)."""
     if not selected:
         return "1y"
-    # valitaan pisin tarvittu periodi
     best = 1
-    for _, per_lbl in selected:
-        key = per_lbl.lower()
-        best = max(best, PERIOD_ORDER.get(key, 5))
-    # mapataan takaisin period-stringiin
+    for _, per_key, _ in selected:
+        best = max(best, PERIOD_ORDER.get(per_key.lower(), 5))
+    # Palauta vastaava period-string; YTD:n kohdalla haetaan 1y ja leikataan myöhemmin
     for k,v in PERIOD_ORDER.items():
         if v == best:
             return "1y" if k == "ytd" else k
 
 @st.cache_data(ttl=900, show_spinner=False)
-def dl_batch(tickers: List[str], period: str = "1y", interval: str = "1d") -> dict[str, pd.DataFrame]:
+def dl_batch(tickers: List[str], period: str = "1y", interval: str = "1d") -> Dict[str, pd.DataFrame]:
     """
-    Hakee kaikki tikkerit yhdellä pyynnöllä.
-    Palauttaa dictin: symbol -> DataFrame
+    Hakee kaikki tikkerit yhdellä pyynnöllä. Palauttaa dict: symbol -> DataFrame.
     """
-    out: dict[str, pd.DataFrame] = {}
+    out: Dict[str, pd.DataFrame] = {}
     if not tickers:
         return out
 
     sess = yahoo_session()
     _period = period.lower()
-    # jos UI tulee joskus pyytämään ytd, noudetaan 1y
     if _period == "ytd":
         _period = "1y"
 
     joined = " ".join(sorted(set(tickers)))
-    # pieni throttlaus ennen isoa pyyntöä
-    time.sleep(0.6 + random.uniform(0.0, 0.4))
+    time.sleep(0.5 + random.uniform(0.0, 0.4))  # pieni hengähdys
 
     try:
         df = yf.download(
@@ -132,10 +126,8 @@ def dl_batch(tickers: List[str], period: str = "1y", interval: str = "1d") -> di
 
     if not df.empty:
         if isinstance(df.columns, pd.MultiIndex):
-            # Oletus: taso 0 = kenttä (Close/Adj Close...), taso 1 = ticker
-            # Poimitaan kullekin tickerille omat sarakkeet
-            tickers_sorted = sorted(set(tickers))
-            for t in tickers_sorted:
+            # MultiIndex: taso 0 = kenttä (Close...), taso 1 = ticker
+            for t in sorted(set(tickers)):
                 try:
                     sub = df.xs(t, level=1, axis=1, drop_level=False)
                     sub = sub.droplevel(1, axis=1)
@@ -143,11 +135,9 @@ def dl_batch(tickers: List[str], period: str = "1y", interval: str = "1d") -> di
                 except Exception:
                     pass
         else:
-            # Jos tuli vain yksittäinen tickeri
             if len(set(tickers)) == 1:
                 out[tickers[0]] = _normalize_cols(df)
             else:
-                # Viimeinen oljenkorsi: etsi ticker-suffiksit sarakkeista
                 for t in set(tickers):
                     cols = [c for c in df.columns if isinstance(c, str) and c.endswith(t)]
                     if cols:
@@ -160,7 +150,7 @@ def dl_batch(tickers: List[str], period: str = "1y", interval: str = "1d") -> di
     missing = [t for t in set(tickers) if t not in out]
     for t in missing:
         try:
-            time.sleep(1.0 + random.uniform(0.0, 0.4))
+            time.sleep(0.8 + random.uniform(0.0, 0.4))
             dfi = yf.download(
                 t, period=_period, interval=interval,
                 auto_adjust=False, progress=False, threads=False,
@@ -189,52 +179,99 @@ def ytd_slice(series: pd.Series) -> pd.Series:
     start = pd.Timestamp(year=date.today().year, month=1, day=1, tz=series.index.tz)
     return series.loc[series.index >= start]
 
+def cut_series_to_period(s: pd.Series, per_key: str) -> pd.Series:
+    """Leikkaa sarjan loppupää halutun periodin pituuteen (paitsi max)."""
+    if s.empty:
+        return s
+    if not isinstance(s.index, pd.DatetimeIndex):
+        s = s.copy()
+        s.index = pd.to_datetime(s.index)
+
+    per = per_key.lower()
+    if per == "max":
+        return s
+    if per == "ytd":
+        return ytd_slice(s)
+
+    days_map = {
+        "1mo": 31, "3mo": 93, "6mo": 186,
+        "1y": 365, "2y": 2*365, "5y": 5*365,
+        "10y": 10*365, "15y": 15*365
+    }
+    n_days = days_map.get(per, 365)
+    cutoff = s.index.max() - timedelta(days=n_days)
+    return s.loc[s.index >= cutoff]
+
 def normal_cdf(x: float) -> float:
     # ilman SciPyä
     return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
 # ---------------------------
-# 2) UI
+# 2) SIDEBAR
 # ---------------------------
-
 with st.sidebar:
     st.subheader("Valitse symboli ja aikajakso")
-    # Haku
+
+    # --- Haku ---
     q = st.text_input("Haku (aksentiton)", "")
     if q.strip():
-        filtered = [(lab,val) for lab,val in ALL_OPTIONS
-                    if strip_accents(q) in strip_accents(lab) or strip_accents(q) in strip_accents(val)]
+        filtered = [
+            (lab, val) for lab, val in ALL_OPTIONS
+            if strip_accents(q) in strip_accents(lab) or strip_accents(q) in strip_accents(val)
+        ]
         if not filtered:
             st.info("Ei osumia suodatuksella – näytetään kaikki.")
             filtered = ALL_OPTIONS
     else:
         filtered = ALL_OPTIONS
 
+    # --- Symboli ---
     lab2sym = {lab: val for lab, val in filtered}
-    choice = st.selectbox("Symboli", [lab for lab,_ in filtered], index=0)
+    choice = st.selectbox("Symboli", [lab for lab, _ in filtered], index=0)
     sym = lab2sym[choice]
 
-    period_map = {"1kk":"1mo","3kk":"3mo","6kk":"6mo","YTD":"ytd","1v":"1y","2v":"2y","5v":"5y","10v":"10y","15v":"15y","MAX":"max"}
-    period_label = st.selectbox("Aikajakso", list(period_map.keys()), index=4)
+    # --- Aikajakso ---
+    period_map = {
+        "1kk": "1mo",
+        "3kk": "3mo",
+        "6kk": "6mo",
+        "YTD": "ytd",
+        "1v": "1y",
+        "2v": "2y",
+        "5v": "5y",
+        "10v": "10y",
+        "15v": "15y",
+        "MAX": "max",
+    }
+    period_label_ui = st.selectbox("Aikajakso", list(period_map.keys()), index=4)
+    period_key = period_map[period_label_ui]
 
-    col_a, col_b = st.columns([1,1])
+    # --- Aikasarja (resoluutio) ---
+    interval = st.selectbox(
+        "Aikasarja (resoluutio)",
+        ["1d (päivä)", "1wk (viikko)", "1mo (kuukausi)"],
+        index=2,  # oletuksena kuukausi (vähemmän 429-virheitä)
+    )
+    interval_map = {"1d (päivä)": "1d", "1wk (viikko)": "1wk", "1mo (kuukausi)": "1mo"}
+    interval_key = interval_map[interval]
+
+    # --- Napit ---
+    col_a, col_b = st.columns([1, 1])
     if "selected_plots" not in st.session_state:
-        st.session_state.selected_plots = []
+        # lista tupleja: (symbol, period_key, interval_key)
+        st.session_state.selected_plots: List[Tuple[str,str,str]] = []
 
     if col_a.button("Lisää kuvaaja"):
-        st.session_state.selected_plots.append((sym, period_map[period_label]))
+        st.session_state.selected_plots.append((sym, period_key, interval_key))
     if col_b.button("Tyhjennä kaikki"):
         st.session_state.selected_plots = []
 
-    st.caption("Vinkki: batch-lataus vähentää 429-virheitä. Välimuisti 15 min.")
-
-sel: List[Tuple[str,str]] = st.session_state.selected_plots
+    st.caption("Vinkki: käytä kuukausitolppia (1mo) jos 429-virheitä ilmenee. Välimuisti 15 min.")
 
 # ---------------------------
-# 3) Piirto (3/rivi)
+# 3) Piirto
 # ---------------------------
-def plot_one(ax, symbol: str, per_key: str, dfs: dict[str, pd.DataFrame]):
-    df = dfs.get(symbol, pd.DataFrame())
+def plot_one(ax, symbol: str, per_key: str, df: pd.DataFrame):
     if df.empty:
         ax.text(0.5,0.5,f"Ei dataa:\n{symbol}", ha="center", va="center")
         ax.axis("off"); return
@@ -243,14 +280,7 @@ def plot_one(ax, symbol: str, per_key: str, dfs: dict[str, pd.DataFrame]):
         ax.text(0.5,0.5,f"Ei hintasarjaa:\n{symbol}", ha="center", va="center")
         ax.axis("off"); return
 
-    if per_key.lower() == "ytd":
-        s = ytd_slice(s)
-    else:
-        # leikkaa sarja suoraan period-avaimen mukaan, jos se on lyhyempi kuin haettu
-        # (dl_batch haki pisimmän tarpeen, joten tässä voidaan “tailata” päivämäärällä)
-        # yksinkertaisuus: annetaan s sellaisenaan (riittää useimpiin käyttötarpeisiin)
-        pass
-
+    s = cut_series_to_period(s, per_key)
     if s.dropna().empty:
         ax.text(0.5,0.5,f"Ei datapisteitä:\n{symbol}", ha="center", va="center")
         ax.axis("off"); return
@@ -282,23 +312,32 @@ def plot_one(ax, symbol: str, per_key: str, dfs: dict[str, pd.DataFrame]):
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8, loc="upper left")
 
+sel: List[Tuple[str,str,str]] = st.session_state.selected_plots
 if not sel:
-    st.info("Valitse symboli ja aikajakso sivupalkista, lisää kuvaaja.")
+    st.info("Valitse symboli, aikajakso ja resoluutio sivupalkista, lisää kuvaaja.")
 else:
-    # päättele pisin tarvittava latausperiodi batchille
-    fetch_period = _fetch_period_for(sel)
-    uniq_syms = sorted({s for s,_ in sel})
+    # Ryhmitellään valinnat intervalin mukaan -> yksi batch/interval
+    by_interval: Dict[str, List[Tuple[str,str,str]]] = {}
+    for item in sel:
+        by_interval.setdefault(item[2], []).append(item)
 
-    with st.spinner(f"Haetaan dataa: {', '.join(uniq_syms)} (periodi: {fetch_period})"):
-        dfs = dl_batch(uniq_syms, period=fetch_period, interval="1d")
+    # Haetaan data jokaiselle interval-ryhmälle
+    dfs_by_interval: Dict[str, Dict[str, pd.DataFrame]] = {}
+    for interv, items in by_interval.items():
+        fetch_period = fetch_period_for(items)
+        uniq_syms = sorted({s for s,_,_ in items})
+        with st.spinner(f"Haetaan dataa ({interv}): {', '.join(uniq_syms)} | periodi: {fetch_period}"):
+            dfs_by_interval[interv] = dl_batch(uniq_syms, period=fetch_period, interval=interv)
 
+    # Piirretään 3/rivi
     cols = 3
     rows = int(np.ceil(len(sel)/cols))
     fig, axes = plt.subplots(rows, cols, figsize=(6*cols, 4.2*rows), squeeze=False)
-    for idx, (symbol, per_key) in enumerate(sel):
+    for idx, (symbol, per_key, interv) in enumerate(sel):
         r, c = divmod(idx, cols)
-        plot_one(axes[r][c], symbol, per_key, dfs)
-        time.sleep(0.1)  # pieni hengähdys piirtojen välissä
+        dfs = dfs_by_interval.get(interv, {})
+        plot_one(axes[r][c], symbol, per_key, dfs.get(symbol, pd.DataFrame()))
+        time.sleep(0.05)  # pieni hengähdys
 
     # piilota tyhjät ruudut
     for k in range(len(sel), rows*cols):
@@ -308,7 +347,7 @@ else:
     st.pyplot(fig, clear_figure=True)
 
     # Näytä viimeksi lisätyn taulukon häntä
-    last_sym, last_per = sel[-1]
-    dfl = dfs.get(last_sym, pd.DataFrame())
-    if not dfl.empty:
-        st.dataframe(dfl.tail().reset_index(), use_container_width=True, hide_index=True)
+    last_sym, last_per, last_interv = sel[-1]
+    dflast = dfs_by_interval.get(last_interv, {}).get(last_sym, pd.DataFrame())
+    if not dflast.empty:
+        st.dataframe(dflast.tail().reset_index(), use_container_width=True, hide_index=True)
